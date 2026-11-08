@@ -1,0 +1,21 @@
+# Private notes (study guide, log, the word list of scripts/check_public.sh)
+notes/
+# Generated: fallen-pose pools, training logs, videos
+data/*.npz
+logs/
+wandb/
+*.tfevents.*
+videos*/
+scenario_videos/
+*.mp4
+*_sheet.png
+*_sheet.npy
+# Builds and caches
+build/
+__pycache__/
+*.pyc
+.venv/
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store

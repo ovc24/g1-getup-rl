@@ -1,0 +1,16 @@
+{
+ "version": 4,
+ "action_scale": 0.5,
+ "realistic": true,
+ "postures": null,
+ "pool": "data/fallen_poses_v5.npz",
+ "history": 5,
+ "push": 0.4,
+ "pace_s": 3.0,
+ "torque_budget": 0.8,
+ "speed_budget": 0.6,
+ "feet_high": 4.0,
+ "head_scale": 2.0,
+ "joint_dr": true,
+ "source_run": "2026-11-07_20-51-49"
+}
