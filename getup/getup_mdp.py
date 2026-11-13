@@ -210,6 +210,86 @@ def head_contact_force(env: "ManagerBasedRlEnv", sensor_name: str = "head_ground
     return torch.linalg.norm(fh, dim=-1).reshape(fh.shape[0], -1).amax(dim=1)
 
 
+# -- self-contacts: one part of the robot pressing on another --------------------------------
+SELF_FORCE_N = 1.0    # a self-contact counts above this force (N): pressing, not grazing
+
+
+def self_contact_substeps(env: "ManagerBasedRlEnv", sensor_name: str = "self_collision",
+                          force_threshold: float = SELF_FORCE_N) -> torch.Tensor:
+    """Physics substeps of the last step (0..H) in which the strongest self-contact (whole
+    robot against whole robot; a link and its parent never collide) is above
+    force_threshold N. Unitree's walking task has the same term (10 N)."""
+    sensor = env.scene[sensor_name]
+    fh = sensor.data.force_history            # (N, 1, H, 3), index 0 = latest substep
+    if fh is None:
+        f = sensor.data.force
+        assert f is not None
+        mag = torch.linalg.norm(f.reshape(f.shape[0], -1, 3), dim=-1)
+        return (mag > force_threshold).any(dim=1).float()
+    mag = torch.linalg.norm(fh, dim=-1)       # (N, 1, H)
+    return (mag > force_threshold).any(dim=1).float().sum(dim=1)
+
+
+def self_contact_force(env: "ManagerBasedRlEnv", sensor_name: str = "self_collision") -> torch.Tensor:
+    """Strongest self-contact force (N) over the physics substeps of the last step."""
+    return head_contact_force(env, sensor_name)
+
+
+def self_contact_getting_up(env: "ManagerBasedRlEnv", sensor_name: str = "self_collision",
+                            force_threshold: float = SELF_FORCE_N,
+                            standing_weight: float = 0.0) -> torch.Tensor:
+    """self_contact_substeps while the robot is not standing. Standing is left out: in the
+    walking pose the hands hang 2 mm from the hips (the training model's capsules). The
+    standing rewards were meant to keep that pose, but v6 stood with the arms turned in,
+    the hands 7-9 cm inside the hips of Unitree's meshes: link_clearance (v7) covers it.
+    standing_weight (v8): the same cost x this while standing. v7 stood with the right hand
+    leaning on the right hip (~25 N in Unitree's scene; with the links passing through each
+    other, as in the self-collision benchmark, 8.7 cm into it): the clearance measures where
+    the hand is, not where it is pushed."""
+    s = getup_state(env)
+    w = (~s.standing).float() + standing_weight * s.standing.float()
+    return self_contact_substeps(env, sensor_name, force_threshold) * w
+
+
+# -- link clearance (v7): the arm links away from the body, as the benchmark measures it ------
+_CLEARANCE: dict[int, tuple] = {}
+
+
+def clearance_model(env: "ManagerBasedRlEnv", robot_name: str = "robot"):
+    """(LinkClearance, body ids in the robot) for this env, made once."""
+    key = id(env)
+    v = _CLEARANCE.get(key)
+    if v is None:
+        from .clearance import LinkClearance
+        robot = env.scene[robot_name]
+        lc = LinkClearance(device=env.device)
+        ids = []
+        for b in lc.bodies:
+            found, _ = robot.find_bodies(b)
+            if not found:
+                raise ValueError(f"link clearance: no body '{b}' in '{robot_name}'")
+            ids.append(found[0])
+        v = (lc, ids)
+        _CLEARANCE[key] = v
+    return v
+
+
+def link_clearance(env: "ManagerBasedRlEnv", robot_name: str = "robot") -> torch.Tensor:
+    """(N, pairs) signed clearance (m) of the pairs of clearance.PAIRS (an arm link and the
+    body), with stand-ins of the deploy scene's collision shapes; negative: that far in."""
+    lc, ids = clearance_model(env, robot_name)
+    data = env.scene[robot_name].data
+    return lc(data.body_link_pos_w[:, ids], data.body_link_quat_w[:, ids])
+
+
+def clearance_cost(env: "ManagerBasedRlEnv", margin: float = 0.01, cap: float = 0.10) -> torch.Tensor:
+    """cm, summed over the pairs: how much closer than `margin` (m) each pair is, up to
+    `cap` (m) per pair. Always on: getting up and standing. In the walking pose the
+    closest pair is 2.1 cm apart (stand-ins): nothing to pay there."""
+    c = link_clearance(env)
+    return (margin - c).clamp(min=0.0, max=cap).sum(dim=1) * 100.0
+
+
 def head_impact(env: "ManagerBasedRlEnv", sensor_name: str = "head_ground",
                 threshold: float = 50.0, scale: float = 100.0) -> torch.Tensor:
     """(head contact force - threshold) / scale, if positive: hitting the head is much

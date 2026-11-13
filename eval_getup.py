@@ -161,6 +161,12 @@ def main() -> int:
     last_head_t = torch.zeros(n, device=device)
     last_head_pk = torch.zeros(n, device=device)
     last_air = torch.zeros(n, device=device)
+    last_self_t = torch.zeros(n, device=device)
+    last_self_pk = torch.zeros(n, device=device)
+    last_conf_up = torch.zeros(n, device=device)
+    last_conf_st = torch.zeros(n, device=device)
+    last_conf_deep = torch.zeros(n, device=device)
+    last_pair_deep = (torch.zeros_like(term.pair_deep) if term.pair_deep is not None else None)
     last_pelvis = torch.zeros(n, device=device)
     last_pose_err = torch.zeros(n, device=device)
     peak_vz = torch.zeros(n, device=device)
@@ -205,6 +211,13 @@ def main() -> int:
         last_head_t = torch.where(live, term.head_time, last_head_t)
         last_head_pk = torch.where(live, term.head_peak, last_head_pk)
         last_air = torch.where(live, term.air_time, last_air)
+        last_self_t = torch.where(live, term.self_time, last_self_t)
+        last_self_pk = torch.where(live, term.self_peak, last_self_pk)
+        if last_pair_deep is not None:
+            last_conf_up = torch.where(live, term.conf_up_time, last_conf_up)
+            last_conf_st = torch.where(live, term.conf_stand_time, last_conf_st)
+            last_conf_deep = torch.where(live, term.conf_deep, last_conf_deep)
+            last_pair_deep = torch.where(live.unsqueeze(1), term.pair_deep, last_pair_deep)
         last_pelvis = torch.where(live, s.pelvis_z, last_pelvis)
         err = (robot.data.joint_pos - robot.data.default_joint_pos).square().mean(dim=1).sqrt()
         last_pose_err = torch.where(live, err, last_pose_err)
@@ -293,6 +306,28 @@ def main() -> int:
         line += (f"; in those, median {pct(last_air[air_any], 0.5):.2f} s, "
                  f"max {float(last_air.max()):.2f} s")
     print(line)
+    self_any = last_self_t > 0.0
+    print(f"self-contacts while getting up (one part of the robot pressing on another, > "
+          f"{term.cfg.self_force_n:g} N): {100 * float(self_any.float().mean()):.1f} % of the "
+          f"episodes; per episode median {pct(last_self_t, 0.5):.2f} s (p90 "
+          f"{pct(last_self_t, 0.9):.2f}), strongest median {pct(last_self_pk, 0.5):.0f} N (p90 "
+          f"{pct(last_self_pk, 0.9):.0f})")
+    if last_pair_deep is not None:
+        lim = term.cfg.conflict_m
+        print(f"link conflicts (an arm link more than {100 * lim:g} cm into the body, in stand-ins "
+              "of Unitree's deploy shapes: the self-collision benchmark's measure)")
+        for label, t in (("getting up", last_conf_up), ("standing", last_conf_st)):
+            on = t > 0.0
+            print(f"  {label:10s} {100 * float(on.float().mean()):5.1f} % of the episodes; per "
+                  f"episode median {pct(t, 0.5):.2f} s (p90 {pct(t, 0.9):.2f})")
+        print(f"  deepest per episode: median {100 * pct(last_conf_deep, 0.5):.1f} cm (p90 "
+              f"{100 * pct(last_conf_deep, 0.9):.1f})")
+        share = (last_pair_deep > lim).float().mean(dim=0)
+        order = torch.argsort(share, descending=True)[:6]
+        tops = [f"{term.pair_names[int(i)]} {100 * float(share[i]):.0f} % (deepest "
+                f"{100 * float(last_pair_deep[:, i].max()):.1f} cm)" for i in order
+                if float(share[i]) > 0.0]
+        print("  pairs, share of the episodes: " + ("; ".join(tops) if tops else "none"))
     print("motors at >= 95 % of their peak torque, share of the steps "
           f"(getting up: {int(phase_steps[0])} steps, standing: {int(phase_steps[1])})")
     print(f"  {'':22s} {PHASES[0]:>11s} {PHASES[1]:>10s}")

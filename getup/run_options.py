@@ -55,8 +55,11 @@ def describe_pace(p: dict[str, float]) -> str:
 
 
 # Runs made before v5 (their options file has no "feet_high"): no cost for the feet above
-# the pelvis, head costs x1, no joint friction/damping/armature randomization.
-LEGACY_STYLE = {"feet_high": 0.0, "head_scale": 1.0, "joint_dr": False}
+# the pelvis, head costs x1, no joint friction/damping/armature randomization. Runs made
+# before v6 (no "self_collision"): self-contacts cost nothing; before v7 (no "clearance"):
+# no link-clearance cost.
+LEGACY_STYLE = {"feet_high": 0.0, "head_scale": 1.0, "joint_dr": False, "self_collision": 0.0,
+                "clearance": 0.0, "self_standing": 0.0}
 
 
 def resolve_pool(path) -> "Path":
@@ -72,14 +75,26 @@ def resolve_pool(path) -> "Path":
 
 
 def style_options(opts: dict) -> dict:
-    """feet_high, head_scale, joint_dr of a run (make_getup_env_cfg keywords)."""
+    """feet_high, head_scale, joint_dr, self_collision, clearance of a run
+    (make_getup_env_cfg keywords)."""
     if "feet_high" not in opts:
         return dict(LEGACY_STYLE)
     return {"feet_high": float(opts["feet_high"]),
             "head_scale": float(opts.get("head_scale", 1.0)),
-            "joint_dr": bool(opts.get("joint_dr", False))}
+            "joint_dr": bool(opts.get("joint_dr", False)),
+            "self_collision": float(opts.get("self_collision", 0.0)),
+            "clearance": float(opts.get("clearance", 0.0)),
+            "self_standing": float(opts.get("self_standing", 0.0))}
 
 
 def describe_style(s: dict) -> str:
+    sc = float(s.get("self_collision", 0.0))
+    cl = float(s.get("clearance", 0.0))
     return (f"feet above the pelvis cost {s['feet_high']:g}, head costs x{s['head_scale']:g}, "
-            f"joint friction/damping/armature {'randomized' if s['joint_dr'] else 'fixed'}")
+            f"joint friction/damping/armature {'randomized' if s['joint_dr'] else 'fixed'}, "
+            + (f"self-contacts while getting up cost {sc:g}" if sc > 0 else
+               "self-contacts free")
+            + (f", arm links closer than 1 cm to the body cost {cl:g} per cm" if cl > 0 else
+               ", link clearance free")
+            + (f", self-contacts standing cost x{float(s.get('self_standing', 0.0)):g}"
+               if float(s.get("self_standing", 0.0)) > 0 else ""))

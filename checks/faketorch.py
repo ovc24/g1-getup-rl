@@ -223,6 +223,12 @@ class Tensor:
     def amax(self, dim=None):
         return Tensor(self.a.max(axis=dim))
 
+    def amin(self, dim=None):
+        return Tensor(self.a.min(axis=dim))
+
+    def transpose(self, d0, d1):
+        return Tensor(np.swapaxes(self.a, d0, d1))
+
     def clamp(self, min=None, max=None):  # noqa: A002
         a = self.a
         if min is not None:

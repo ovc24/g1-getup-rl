@@ -22,6 +22,15 @@ CPU) if it is not there yet. Watch in tensorboard (logs/rsl_rl/g1_23dof_getup):
   Metrics/getup/reg_scale    regularization weight (0.2 -> 1)
   Metrics/getup/time_to_stand_s   should settle near the pace (2-3 s), not below 1 s
   Metrics/getup/airborne_s, head_ground_s, head_peak_N   ~0, ~0, well below 100 N
+  Metrics/getup/self_contact_s, self_peak_N   one part of the robot pressing on another
+                             while getting up: s per episode (> 1 N), strongest N
+  Metrics/getup/self_scale   share of the self-contact cost in use (0.05 -> 1 while the
+                             success rate stays above 90 %; it falls if the rate drops)
+  Metrics/getup/conflict_up_s, conflict_stand_s, conflict_cm   an arm link more than 1 cm
+                             into the body in Unitree's deploy shapes (the self-collision
+                             benchmark's measure, getup/clearance.py): s per episode getting
+                             up and standing, deepest cm. Logged in every run.
+  Metrics/getup/clear_scale  share of the link-clearance cost in use (as self_scale)
 
 Style (v5 defaults): --feet-high 4 (feet above the pelvis cost: no legs swung up for
 momentum), --head-scale 2 (head on the ground and head hits cost twice the v4 amount),
@@ -34,6 +43,44 @@ releases, see make_fallen_poses.py):
     python <this folder>/train_getup.py --init-checkpoint <v4 run>/model_5999.pt \
         --assist 0 --assist-start 0 --reg-scale-start 1 --iterations 1500 \
         --pool <this folder>/data/fallen_poses_v5.npz --max-std 0.5
+
+v6 (default from v6: --self-collision 1): one part of the robot pressing on another while
+getting up costs (an arm on the chest, a hand in the hip; Unitree's walking task has the
+same cost, v5 had none and leaned its arms on its body). Its weight starts at 5 % and
+follows the success rate (getup_term.py): at full weight from the start, the first try
+forgot how to stand. A fine-tune of the v5 run, on a pool that also has collapses with
+the torque off ("collapse_off": folded, often with the arms between the legs). It
+continues the v5 run with --resume, not --init-checkpoint: --init-checkpoint starts a
+new, empty optimizer (Adam), whose first updates move every weight by about the learning
+rate, whatever the gradient; a converged policy wobbles (more self-contacts, joints at
+their limits) and has to find its way back. On the v5 pool it did, in ~100 iterations;
+on the v6 pool three tries never stood again. --resume also loads v5's optimizer state.
+2000 iterations more (model_1500 ... model_3499): the cost reaches its full weight
+~950 iterations after the success rate passes 90 %.
+    python <this folder>/train_getup.py --resume <v5 run>/model_1499.pt \
+        --assist 0 --assist-start 0 --reg-scale-start 1 --iterations 2000 \
+        --pool <this folder>/data/fallen_poses_v6.npz --max-std 0.5 --self-collision 1
+
+v7 (default from v7: --clearance 0.2): an arm link (shoulder yaw, elbow, hand) closer than
+1 cm to the body costs 0.2 per cm and second, getting up AND standing, measured with
+stand-ins of the collision shapes of Unitree's deploy scene, as the self-collision
+benchmark does. v6 stood with the arms turned in: the hands 7-9 cm inside the hips of
+Unitree's meshes in every episode (its self-contact cost only counts while getting up,
+and in the training model's capsules the hands only touch). Its weight follows the
+success rate like the self-contact cost, here from 25 % (moving the hands out of the hips
+while standing costs the get-up nothing; full weight after ~630 iterations at > 90 %
+success). A fine-tune of the v6 run (--resume; the self-contact cost at full weight from
+the start, as v6 ended). 1500 iterations more: model_3499 ... model_4997.
+    python <this folder>/train_getup.py --resume <v6 run>/model_3498.pt \
+        --assist 0 --assist-start 0 --reg-scale-start 1 --iterations 1500 \
+        --pool <this folder>/data/fallen_poses_v6.npz --max-std 0.5 \
+        --self-collision 1 --self-scale-start 1 --clearance 0.2 --clearance-scale-start 0.25
+Watch Metrics/getup/conflict_stand_s fall to ~0 (v6: ~7 s per episode), conflict_up_s
+stay ~0 and success stay near 1.
+
+The success numbers of the first ~20 iterations of any run are low by construction: the
+first episode of every robot starts at a random time (rsl_rl's init_at_random_ep_len)
+and is cut short.
 
 Every run also gets params/run_info.json (date, command, git commit of this folder and of
 unitree_rl_mjlab and whether they had uncommitted changes, starting checkpoint, md5 of the
@@ -69,8 +116,10 @@ import src.tasks  # noqa: E402,F401  (unitree_rl_mjlab)
 from src.tasks.velocity.config.g1_23dof.rl_cfg import unitree_g1_23dof_ppo_runner_cfg  # noqa: E402
 from src.tasks.velocity.rl import VelocityOnPolicyRunner  # noqa: E402
 
-from getup.getup_env_cfg import (FEET_HIGH, HEAD_SCALE, PACE_S, PUSH,  # noqa: E402
-                                 SPEED_BUDGET, TORQUE_BUDGET, make_getup_env_cfg)
+from getup.clearance import check_scene  # noqa: E402
+from getup.getup_env_cfg import (CLEARANCE, FEET_HIGH, HEAD_SCALE, PACE_S,  # noqa: E402
+                                 PUSH, SELF_COLLISION, SELF_STANDING, SPEED_BUDGET, TORQUE_BUDGET,
+                                 make_getup_env_cfg)
 from getup.poses import DEFAULT_POOL, POSTURES  # noqa: E402
 from getup.provenance import save_provenance  # noqa: E402
 from getup.run_options import describe_pace, describe_style, parse_postures  # noqa: E402
@@ -109,6 +158,24 @@ def main() -> int:
                     help="factor on the head-on-the-ground and head-hit costs")
     ap.add_argument("--no-joint-dr", action="store_true",
                     help="no joint friction/damping/armature randomization")
+    ap.add_argument("--self-collision", type=float, default=SELF_COLLISION,
+                    help="cost of one part of the robot pressing on another while getting up, "
+                         "per physics substep-second, at full weight (0 = off, runs before v6)")
+    ap.add_argument("--self-scale-start", type=float, default=None,
+                    help="share of that cost to start with (default 0.05; it rises while the "
+                         "success rate is above 90 %%, falls below 80 %%); to continue a run, "
+                         "its last Metrics/getup/self_scale")
+    ap.add_argument("--clearance", type=float, default=CLEARANCE,
+                    help="cost of an arm link closer than 1 cm to the body (deploy shapes), "
+                         "per cm and second, at full weight, getting up and standing "
+                         "(0 = off, runs before v7)")
+    ap.add_argument("--self-standing", type=float, default=SELF_STANDING,
+                    help="the self-contact cost while standing too, x this (v8: 1; runs before "
+                         "v8: 0, only while getting up)")
+    ap.add_argument("--clearance-scale-start", type=float, default=None,
+                    help="share of that cost to start with (default 0.05; follows the "
+                         "success rate as --self-scale-start); to continue a run, its last "
+                         "Metrics/getup/clear_scale")
     ap.add_argument("--push", type=float, default=PUSH,
                     help="pushes once up: pelvis velocity change up to +-this m/s every 2-4 s "
                          "(0 = none)")
@@ -144,7 +211,8 @@ def main() -> int:
     pace = {"pace_s": args.pace, "torque_budget": args.torque_budget,
             "speed_budget": args.speed_budget}
     style = {"feet_high": args.feet_high, "head_scale": args.head_scale,
-             "joint_dr": not args.no_joint_dr}
+             "joint_dr": not args.no_joint_dr, "self_collision": args.self_collision,
+             "clearance": args.clearance, "self_standing": args.self_standing}
     env_cfg = make_getup_env_cfg(num_envs=args.num_envs, realistic=not args.no_realistic,
                                  pool_path=pool, posture_weights=parse_postures(args.postures, ap),
                                  action_scale_factor=args.action_scale,
@@ -152,6 +220,8 @@ def main() -> int:
     g = env_cfg.commands["getup"]
     g.assist_start = args.assist_start
     g.reg_scale_start = args.reg_scale_start
+    g.self_scale_start = args.self_scale_start
+    g.clear_scale_start = args.clearance_scale_start
     env_cfg.seed = args.seed
 
     agent_cfg = unitree_g1_23dof_ppo_runner_cfg()
@@ -172,6 +242,22 @@ def main() -> int:
           f"assist={args.assist} N  pool={pool}  log dir: {log_dir}")
     print(f"[INFO] {describe_pace(pace)}, pushes once up +-{args.push} m/s")
     print(f"[INFO] {describe_style(style)}; postures {args.postures or 'default'}")
+    if args.self_collision > 0:
+        start = g.self_start if g.self_scale_start is None else g.self_scale_start
+        print(f"[INFO] self-contact cost: starts at {start:.2f} x {args.self_collision:g}, rises "
+              f"while the success rate is above {100 * g.self_success:.0f} %, falls below "
+              f"{100 * g.self_floor:.0f} % (Metrics/getup/self_scale)")
+    if args.clearance > 0:
+        start = g.clear_start if g.clear_scale_start is None else g.clear_scale_start
+        print(f"[INFO] link-clearance cost: starts at {start:.2f} x {args.clearance:g} per cm, "
+              "follows the success rate as the self-contact cost (Metrics/getup/clear_scale)")
+    try:
+        from src.assets.robots.unitree_g1 import g1_23dof_constants as g1c
+        note = check_scene(Path(g1c.G1_23DOF_XML).parent / "scene_g1_23dof.xml")
+        if note:
+            print(f"[WARNING] {note}")
+    except Exception:  # noqa: BLE001
+        pass
 
     agent_dict = asdict(agent_cfg)
     if not args.no_symmetry:

@@ -10,8 +10,10 @@ plain MuJoCo (CPU) with the same scene model as the training (``make_fallen_pose
      in about the walking pose, barely moving, motors limp from the start (what the robot
      does when its motors go limp while it stands): knees and hips fold where it stands
      and it ends up lying, mostly on the back or the front, the legs folded under or
-     beside it (a limp robot does not stay kneeling: nothing holds the hips); random
-     heading;
+     beside it (a limp robot does not stay kneeling: nothing holds the hips), or
+     COLLAPSE_OFF: the same with the torque off (no motor damping either, a robot switched
+     off): it folds completely, often with the arms caught between the legs and the body;
+     random heading;
   2. joints: a random target pose between the walking pose and a random pose within
      ``JOINT_SAMPLE_RANGES``; poses where limbs go through each other are redrawn;
   3. released a few cm above the ground (lowest point 2-25 cm), with a little random
@@ -41,7 +43,8 @@ from pathlib import Path
 import numpy as np
 
 POSTURES = ("supine", "prone", "left_side", "right_side", "upright", "other")
-DROPS = ("supine", "prone", "left_side", "right_side", "random", "standing", "collapse")
+DROPS = ("supine", "prone", "left_side", "right_side", "random", "standing", "collapse",
+         "collapse_off")
 MODES = ("limp", "hold", "hold_then_limp")
 DEFAULT_POOL = Path(__file__).resolve().parent.parent / "data" / "fallen_poses.npz"
 
@@ -133,11 +136,12 @@ def drop_orientation(drop: str, rng: np.random.Generator, tilt_deg: float = 25.0
     t = math.radians(tilt_deg) * rng.uniform(-1.0, 1.0, size=2)
     if drop == "standing":
         t = 0.4 * t
-    elif drop == "collapse":
+    elif drop in ("collapse", "collapse_off"):
         t = 0.2 * t
     rpy = {
         "standing": (t[0], t[1], 0.0),
         "collapse": (t[0], t[1], 0.0),
+        "collapse_off": (t[0], t[1], 0.0),
         "supine": (t[0], -math.pi / 2 + t[1], 0.0),
         "prone": (t[0], math.pi / 2 + t[1], 0.0),
         "left_side": (-math.pi / 2 + t[0], t[1], 0.0),
@@ -299,7 +303,7 @@ class DropCfg:
     mix_range: tuple[float, float] = (0.2, 1.0)        # 0 = walking pose, 1 = random pose
     standing_mix: float = 0.3                          # "standing" drops: closer to walking
     standing_height: tuple[float, float] = (0.0, 0.01)  # feet just on the ground
-    collapse_mix: float = 0.15                         # "collapse": about the walking pose
+    collapse_mix: float = 0.15                         # "collapse(_off)": about the walking pose
     collapse_vel: float = 0.1                          # +- m/s; x3 rad/s; always limp
     limp_after: tuple[float, float] = (0.2, 0.8)       # hold_then_limp: s
     min_time: float = 0.8
@@ -386,6 +390,16 @@ def _self_penetration(m, d, geom_set: set, tol: float) -> bool:
     return False
 
 
+def motor_damping(m, act, value: float | None = None) -> np.ndarray:
+    """Damping (kv) of these position actuators (MuJoCo: biasprm[2] = -kv); with value,
+    set it (0 = torque off: with ctrl = qpos the actuator gives no force at all). Returns
+    the values it had."""
+    old = np.array(m.actuator_biasprm[act, 2], copy=True)
+    if value is not None:
+        m.actuator_biasprm[act, 2] = value
+    return old
+
+
 def _lowest(m, d, ix: RobotIndex) -> float:
     g = ix.geom_ids
     return lowest_point(m.geom_type[g], m.geom_size[g], d.geom_xpos[g], d.geom_xmat[g],
@@ -395,12 +409,22 @@ def _lowest(m, d, ix: RobotIndex) -> float:
 def drop_once(m, d, ix: RobotIndex, default_q: np.ndarray, lo: np.ndarray, hi: np.ndarray,
               cfg: DropCfg, rng: np.random.Generator):
     """One drop. Returns (qpos at rest, drop id, mode id, settle time) or None."""
-    import mujoco
     drop = _choice(rng, cfg.drop_weights, DROPS)
     mode = _choice(rng, cfg.mode_weights, MODES)
-    collapse = DROPS[drop] == "collapse"
+    collapse = DROPS[drop] in ("collapse", "collapse_off")
     if collapse:
         mode = MODES.index("limp")
+    saved = motor_damping(m, ix.joint_act, 0.0) if DROPS[drop] == "collapse_off" else None
+    try:
+        return _drop(m, d, ix, default_q, lo, hi, cfg, rng, drop, mode, collapse)
+    finally:
+        if saved is not None:                  # the model is reused for the next drop
+            m.actuator_biasprm[ix.joint_act, 2] = saved
+
+
+def _drop(m, d, ix: RobotIndex, default_q, lo, hi, cfg: DropCfg, rng, drop: int, mode: int,
+          collapse: bool):
+    import mujoco
     geom_set = set(int(g) for g in ix.geom_ids)
     q0 = ix.root_qadr
     for _ in range(cfg.max_tries):
@@ -420,7 +444,8 @@ def drop_once(m, d, ix: RobotIndex, default_q: np.ndarray, lo: np.ndarray, hi: n
     else:
         return None
     # Release height: lowest point of the robot at a random height above the ground.
-    h = cfg.standing_height if DROPS[drop] in ("standing", "collapse") else cfg.height_range
+    h = cfg.standing_height if DROPS[drop] in ("standing", "collapse", "collapse_off") \
+        else cfg.height_range
     d.qpos[q0 + 2] += rng.uniform(*h) - _lowest(m, d, ix)
     v0 = ix.root_vadr
     lin, ang = (cfg.collapse_vel, 3.0 * cfg.collapse_vel) if collapse else (cfg.lin_vel, cfg.ang_vel)

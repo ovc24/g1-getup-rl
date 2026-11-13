@@ -394,10 +394,22 @@ st_ok = all(ps.quat_to_mat(ps.drop_orientation("standing", rng, 25.0))[2, 2] > m
 check(st_ok, "standing release: upright within 10 deg per axis")
 co_ok = all(ps.quat_to_mat(ps.drop_orientation("collapse", rng, 25.0))[2, 2] > math.cos(math.radians(7.1))
             for _ in range(200))
-check(co_ok and ps.DROPS[-1] == "collapse" and ps.DropCfg().drop_weights.get("collapse", 0.0) == 0.0
+check(co_ok and ps.DROPS[:7] == ("supine", "prone", "left_side", "right_side", "random",
+                                  "standing", "collapse")
+      and ps.DropCfg().drop_weights.get("collapse", 0.0) == 0.0
       and ps.DropCfg().collapse_mix < ps.DropCfg().standing_mix,
       "collapse release: upright within 5 deg per axis, closer to the walking pose than "
-      "'standing'; last in DROPS (older pools keep their indices), not in the default mix")
+      "'standing'; added after the first six (older pools keep their indices), not in the "
+      "default mix")
+cf_ok = all(ps.quat_to_mat(ps.drop_orientation("collapse_off", rng, 25.0))[2, 2] > math.cos(math.radians(7.1))
+            for _ in range(200))
+check(cf_ok and ps.DROPS[-1] == "collapse_off" and "collapse_off" not in ps.DropCfg().drop_weights,
+      "collapse with the torque off: released like a collapse, last in DROPS, not in the default mix")
+fm = SimpleNamespace(actuator_biasprm=np.array([[0.0, -40.0, -2.5], [0.0, -99.0, -6.3], [0.0, -14.0, -0.9]]))
+old_kv = ps.motor_damping(fm, np.array([0, 2]), 0.0)
+check(np.allclose(old_kv, [-2.5, -0.9]) and np.allclose(fm.actuator_biasprm[:, 2], [0.0, -6.3, 0.0])
+      and np.allclose(fm.actuator_biasprm[:, 1], [-40.0, -99.0, -14.0]),
+      "torque off: the damping of the position actuators set to 0 (stiffness untouched), old values kept")
 q = ps.quat_from_rpy(0.3, -0.4, 1.2)
 r = ps.quat_to_mat(q)
 check(abs(np.linalg.det(r) - 1) < 1e-9 and np.allclose(r @ r.T, np.eye(3)), "rotation matrix")
@@ -523,9 +535,55 @@ nr = gec.make_getup_env_cfg(pool_path=tmp, randomize=False)
 check("joint_friction" not in nr.events and "friction" not in nr.events,
       "randomize=False: no joint randomization either")
 new_style = {"feet_high": 4.0, "head_scale": 2.0, "joint_dr": True}
-check(ro.style_options(dict(new_style, pace_s=3.0)) == new_style
-      and ro.style_options({}) == ro.LEGACY_STYLE and "fixed" in ro.describe_style(ro.LEGACY_STYLE),
-      "run options: v5 style saved and read back; older runs get the legacy style")
+check(ro.style_options(dict(new_style, pace_s=3.0)) == dict(new_style, self_collision=0.0,
+                                                             clearance=0.0, self_standing=0.0)
+      and ro.style_options({}) == ro.LEGACY_STYLE and "fixed" in ro.describe_style(ro.LEGACY_STYLE)
+      and "free" in ro.describe_style(ro.LEGACY_STYLE),
+      "run options: v5 style saved and read back (a v5 run: self-contacts free); older runs "
+      "get the legacy style")
+v6_style = dict(new_style, self_collision=1.0)
+check(ro.style_options(dict(v6_style, pace_s=3.0)) == dict(v6_style, clearance=0.0,
+                                                            self_standing=0.0)
+      and "self-contacts while getting up cost 1" in ro.describe_style(v6_style)
+      and "link clearance free" in ro.describe_style(v6_style),
+      "run options: v6 style saved and read back (a v6 run: link clearance free)")
+v7_style = dict(v6_style, clearance=0.2)
+check(ro.style_options(dict(v7_style, pace_s=3.0)) == dict(v7_style, self_standing=0.0)
+      and "closer than 1 cm to the body cost 0.2 per cm" in ro.describe_style(v7_style),
+      "run options: v7 style saved and read back (a v7 run: no self-contact cost standing)")
+v8_style = dict(v7_style, self_standing=1.0)
+check(ro.style_options(dict(v8_style, pace_s=3.0)) == v8_style
+      and "self-contacts standing cost x1" in ro.describe_style(v8_style)
+      and rew["self_contact"].params.get("standing_weight") == gec.SELF_STANDING == 1.0
+      and gec.make_getup_env_cfg(pool_path=tmp, **ro.style_options(dict(v7_style, pace_s=3.0)))
+      .rewards["self_contact"].params["standing_weight"] == 0.0,
+      "v8 style: self-contacts cost while standing too; a v7 run rebuilt without it")
+check("link_clearance" in rew and rew["link_clearance"].weight == -gec.CLEARANCE == -0.2
+      and rew["link_clearance"].params == {"margin": 0.01, "cap": 0.10}
+      and "link_clearance" not in gec.REG_TERMS and g.clear_weight == 0.2,
+      "v7 style: arm links closer than 1 cm to the body cost 0.2 per cm and second, weight "
+      "following the success rate")
+check("link_clearance" not in gec.make_getup_env_cfg(pool_path=tmp, clearance=0.0).rewards
+      and "link_clearance" not in oc.rewards
+      and "link_clearance" not in gec.make_getup_env_cfg(
+          pool_path=tmp, **ro.style_options(dict(v6_style, pace_s=3.0))).rewards,
+      "--clearance 0, runs before v5 and v6 runs: no link-clearance cost")
+sens = {s.name: s for s in cfg.scene.sensors}
+scs = sens.get("self_collision")
+check(scs is not None and scs.primary.mode == scs.secondary.mode == "subtree"
+      and scs.primary.pattern == scs.secondary.pattern == "pelvis" and scs.reduce == "maxforce"
+      and scs.history_length == 4 and "force" in scs.fields,
+      "self-collision sensor: whole robot against whole robot, strongest contact, every substep")
+check("self_contact" in rew and rew["self_contact"].weight == -gec.SELF_COLLISION == -1.0
+      and rew["self_contact"].params["force_threshold"] == gm.SELF_FORCE_N == 1.0
+      and "self_contact" not in gec.REG_TERMS,
+      "v6 style: self-contacts while getting up cost 1 per substep-second (> 1 N), full weight "
+      "from the start (not in the curriculum)")
+check("self_contact" not in gec.make_getup_env_cfg(pool_path=tmp, self_collision=0.0).rewards
+      and "self_contact" not in oc.rewards
+      and "self_contact" not in gec.make_getup_env_cfg(
+          pool_path=tmp, **ro.style_options(dict(new_style, pace_s=3.0))).rewards,
+      "--self-collision 0, runs before v5 and v5 runs: no self-contact cost")
 
 # -- fake env -------------------------------------------------------------------------------------
 N = 8
@@ -552,7 +610,11 @@ class FakeRobot:
             joint_pos=torch.tensor(np.tile(DEFAULT, (N, 1))),
             default_joint_pos=torch.tensor(np.tile(DEFAULT, (N, 1))),
             joint_pos_target=torch.tensor(np.tile(DEFAULT, (N, 1))),
-            joint_vel=torch.zeros(N, 23), body_link_pos_w=torch.zeros(N, nb, 3),
+            joint_vel=torch.zeros(N, 23),
+            # every body 3 m from the next (no link conflicts), not rotated
+            body_link_pos_w=torch.tensor(np.tile(np.c_[3.0 * np.arange(nb), np.zeros((nb, 2))],
+                                                 (N, 1, 1)).astype(np.float32)),
+            body_link_quat_w=torch.tensor(np.tile([1.0, 0.0, 0.0, 0.0], (N, nb, 1)).astype(np.float32)),
             body_link_lin_vel_w=torch.zeros(N, nb, 3), root_link_vel_w=torch.zeros(N, 6),
             data=SimpleNamespace(geom_xpos=torch.zeros(N, ng, 3)),
             indexing=SimpleNamespace(geom_ids=torch.tensor(
@@ -606,7 +668,8 @@ class FakeEnv:
         self.episode_length_buf = torch.zeros(N, dtype=torch.long)
         robot = FakeRobot()
         self._scene = {"robot": robot, "body_ground": FakeSensor(len(cnames)),
-                       "head_ground": FakeSensor(1, history=4)}
+                       "head_ground": FakeSensor(1, history=4),
+                       "self_collision": FakeSensor(1, history=4)}
         self.scene = FakeScene(self._scene)
         self.reward_manager = FakeRewardManager(rew)
 
@@ -615,6 +678,7 @@ env = FakeEnv()
 robot = env._scene["robot"]
 contact = env._scene["body_ground"]
 head_s = env._scene["head_ground"]
+self_s = env._scene["self_collision"]
 ids = gm.robot_ids(env)
 check(ids.head == HEAD_LOCAL + GLOBAL_GEOM_OFFSET, "head geom: global id through the entity indexing")
 check([ids.contact_names[i] for i in ids.feet_cols] == list(rb.FOOT_BODIES),
@@ -684,6 +748,17 @@ rew_tol = gm.tolerance(torch.tensor([1.20, 1.10, 0.95, 0.30]), 1.10, margin=0.8)
 check(np.allclose(rew_tol.numpy(), [1.0, 1.0, math.exp(-0.5 * (0.15 / 0.8 * math.sqrt(-2 * math.log(0.1))) ** 2), 0.1],
                   atol=1e-5), f"tolerance: 1 at/above the target, {float(rew_tol[2]):.2f} 15 cm below, "
       "0.1 at the margin")
+fh = np.zeros((N, 1, 4, 3), dtype=np.float32)
+fh[2, 0, :2, 0] = 30.0        # sitting up, an elbow on the thigh: 2 of 4 substeps
+fh[3, 0, 0, 2] = 0.5          # on hands and knees: 0.5 N, grazing
+fh[6, 0, :, 1] = 20.0         # standing, a hand on the hip
+self_s.data.force_history = torch.tensor(fh)
+sc_v = gm.self_contact_getting_up(env).numpy()
+check(np.allclose(sc_v[:7], [0, 0, 2, 0, 0, 0, 0]),
+      f"self-contact cost: substeps > 1 N while not standing (sitting 2, grazing 0, standing "
+      f"left out): {sc_v[:7]}")
+check(abs(float(gm.self_contact_force(env)[2]) - 30.0) < 1e-4, "strongest self-contact of the step")
+self_s.data.force_history = torch.zeros(N, 1, 4, 3)
 robot.data.joint_pos[6, JOINTS.index("waist_yaw_joint")] = 1.4
 check(abs(float(dev_term(env, None)[6]) - 0.5) < 1e-5, "joint deviation beyond 0.9 rad (waist 1.4 -> 0.5)")
 robot.data.joint_pos[6] = torch.tensor(DEFAULT)
@@ -878,14 +953,59 @@ for _ in range(10):
 set_state(0, 0.12, 0.13, 90, ("pelvis", "torso_link"))
 check(abs(float(term.air_time[0]) - 0.2) < 1e-5 and np.allclose(term.air_time.numpy()[1:], 0.0),
       f"flight time: 10 steps in the air = {float(term.air_time[0]):.2f} s")
+fh = np.zeros((N, 1, 4, 3), dtype=np.float32)
+fh[1, 0, :, 0] = 80.0         # lying, an arm pressed on the chest, every substep
+fh[2, 0, :1, 0] = 10.0        # lying, 1 substep of 4
+fh[5, 0, :, 0] = 15.0         # standing, a hand on the hip: not counted
+self_s.data.force_history = torch.tensor(fh)
+for _ in range(5):
+    env.episode_length_buf += 1
+    term.compute(env.step_dt)
+self_s.data.force_history = torch.zeros(N, 1, 4, 3)
+stt = term.self_time.numpy()
+check(abs(stt[1] - 0.1) < 1e-5 and abs(stt[2] - 0.025) < 1e-5 and stt[5] == 0.0
+      and abs(float(term.self_peak[1]) - 80.0) < 1e-3 and float(term.self_peak[5]) == 0.0,
+      f"self-contact time while getting up: 5 steps pressing = {stt[1]:.3f} s, 1 substep of 4 "
+      f"= {stt[2]:.3f} s, standing 0; strongest {float(term.self_peak[1]):.0f} N")
+bi = {b: i for i, b in enumerate(BODIES)}
+saved_lp = robot.data.body_link_pos_w.clone()
+lp = saved_lp.numpy().copy()
+lp[1, bi["right_wrist_roll_rubber_hand"]] = lp[1, bi["right_hip_roll_link"]]    # lying: hand in hip
+lp[5, bi["left_wrist_roll_rubber_hand"]] = lp[5, bi["left_hip_pitch_link"]]     # standing: the same
+robot.data.body_link_pos_w = torch.tensor(lp)
+cost = gm.clearance_cost(env).numpy()
+for _ in range(5):
+    env.episode_length_buf += 1
+    term.compute(env.step_dt)
+robot.data.body_link_pos_w = saved_lp
+cu, cst = term.conf_up_time.numpy(), term.conf_stand_time.numpy()
+names = term.pair_names
+ip = names.index("right_hip_roll_link - right_wrist_roll_rubber_hand")
+check(abs(cu[1] - 0.1) < 1e-5 and cst[1] == 0.0 and abs(cst[5] - 0.1) < 1e-5 and cu[5] == 0.0
+      and np.allclose(np.delete(cu, 1), 0.0) and np.allclose(np.delete(cst, 5), 0.0)
+      and float(term.conf_deep[1]) > 0.01 and float(term.pair_deep[1, ip]) > 0.01,
+      f"link conflicts: a hand in the hip 5 steps = {cu[1]:.2f} s getting up (lying) and "
+      f"{cst[5]:.2f} s standing; deepest {100 * float(term.conf_deep[1]):.1f} cm")
+check(cost[1] > 1.0 and cost[5] > 1.0 and cost[0] == 0.0 and cost[1] <= 10.0 * len(names),
+      f"link-clearance cost: {cost[1]:.1f} cm for the hand in the hip, 0 with every body apart")
 ex = term.reset(all_ids)
 check(abs(ex["success"] - 0.5) < 1e-6 and abs(ex["stood_up"] - 0.5) < 1e-6
       and abs(ex["time_to_stand_s"] - 0.5 * 10.0) < 0.02 and abs(ex["airborne_s"] - 0.2 / N) < 1e-6,
       f"episode metrics: success {ex['success']:.2f}, time to stand {ex['time_to_stand_s']:.2f} s "
       f"(never = 10 s), flight {ex['airborne_s']:.3f} s (mean)")
-check(np.allclose(term.air_time.numpy(), 0.0), "flight time cleared at the reset")
+check(np.allclose(term.air_time.numpy(), 0.0) and np.allclose(term.self_time.numpy(), 0.0)
+      and "self_contact_s" in ex and abs(ex["self_contact_s"] - (0.1 + 0.025) / N) < 1e-5,
+      "flight and self-contact times cleared at the reset; the episode metric is logged")
+check(np.allclose(term.conf_up_time.numpy(), 0.0) and np.allclose(term.pair_deep.numpy(), 0.0)
+      and abs(ex["conflict_up_s"] - 0.1 / N) < 1e-5 and abs(ex["conflict_stand_s"] - 0.1 / N) < 1e-5
+      and ex["conflict_cm"] > 2.0 / N,
+      "link-conflict times cleared at the reset; conflict_up_s, conflict_stand_s, conflict_cm logged")
 check(abs(term.success_ema - 0.5) < 1e-6 and term.assist == 200.0 and abs(term.reg_scale - 0.24) < 1e-9,
       f"after a 50 % batch: ema {term.success_ema:.2f}, assist {term.assist:.0f} N, reg {term.reg_scale:.2f}")
+check(gcfg.self_weight == 1.0 and term.self_scale == 0.0
+      and env.reward_manager.get_term_cfg("self_contact").weight == 0.0,
+      "self-contact cost: starts at 5 %, a 50 % batch (below 80 %) takes it down twice as fast "
+      "as it rises: 0.05 - 2/40 -> 0")
 rounds = 0
 while term.assist > 0 and rounds < 100:
     for i in range(N):
@@ -897,6 +1017,23 @@ while term.assist > 0 and rounds < 100:
     env.episode_length_buf = torch.zeros(N, dtype=torch.long)
     rounds += 1
 check(9 <= rounds <= 11, f"all succeeding: assist force gone after {rounds} rounds of num_envs episodes")
+sw = env.reward_manager.get_term_cfg("self_contact").weight
+check(abs(term.self_scale - rounds / 40.0) < 1e-9 and abs(sw + term.self_scale) < 1e-12,
+      f"all succeeding: the self-contact cost rises 1/40 per round: {term.self_scale:.3f} after "
+      f"{rounds} rounds, weight {sw:.3f}")
+cw = env.reward_manager.get_term_cfg("link_clearance").weight
+check(abs(term.clear_scale - rounds / 40.0) < 1e-9 and abs(cw + 0.2 * term.clear_scale) < 1e-12,
+      f"the link-clearance cost follows the same rule: {term.clear_scale:.3f}, weight {cw:.4f}")
+keep = term.self_scale
+for i in range(N):                 # a failing round: nobody stands
+    set_state(i, 0.12, 0.13, 90, ("pelvis", "torso_link"))
+term.stand_time = torch.zeros(N)
+term.reset(all_ids)
+check(abs(term.self_scale - (keep - 2.0 / 40.0)) < 1e-9,
+      f"a failing round (average {term.success_ema:.2f}): self-contact cost back down to "
+      f"{term.self_scale:.3f}")
+for i in range(N):
+    set_state(i, 0.76, 1.23, 2)
 while term.reg_scale < 1.0 and rounds < 100:
     term.stand_time = torch.full((N,), 2.0)
     term.reset(all_ids)

@@ -32,7 +32,7 @@ python <this repo>/deploy/install_getup.py --deploy deploy \
 cd deploy/robots/g1_23dof/build && make -j4
 ```
 
-Without training, with the policy of this repo: `--policy-dir policy/getup_v5` instead of
+Without training, with the policy of this repo: `--policy-dir policy/getup_v6` instead of
 `--getup-run ...` (the folder as `policy/<name>`, found in this repo from any folder).
 
 `--auto`: after a fall it gets up by itself once it lies still; `--manual` (default for a

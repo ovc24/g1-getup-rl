@@ -46,6 +46,7 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
 from . import getup_mdp as gm
+from .clearance import MARGIN_M
 from .getup_term import GetUpCommandCfg
 from .robot import (CONTACT_BODIES, FOOT_BODIES, HEAD_GEOM, action_scale, get_robot_cfg,
                     motor_groups)
@@ -60,6 +61,9 @@ PUSH = 0.4            # pushes once up: pelvis velocity change up to +-0.4 m/s (
 FEET_HIGH = 4.0       # feet above the pelvis: 4 per m per second (0 = off; runs before v5)
 HEAD_SCALE = 2.0      # head on the ground and head hits: x2 (runs before v5: x1)
 JOINT_DR = True       # joint friction, damping, armature per robot (runs before v5: off)
+SELF_COLLISION = 1.0  # self-contacts while getting up cost 1 per substep-second (before v6: 0)
+SELF_STANDING = 1.0   # the self-contact cost while standing too, x this (before v8: 0)
+CLEARANCE = 0.2       # arm links closer than 1 cm to the body: 0.2 per cm and second (before v7: 0)
 REG_TERMS = ("action_rate_l2", "joint_acc_l2", "joint_vel_l2", "joint_torques_l2",
              "joint_pos_limits", "joint_overspeed", "torque_budget", "feet_slip")
 
@@ -85,7 +89,19 @@ def make_sensors() -> tuple[ContactSensorCfg, ...]:
         num_slots=1,
         history_length=4,
     )
-    return body_ground, head_ground
+    # One part of the robot on another (whole robot against whole robot; a link and its
+    # parent never collide): the strongest such contact of every physics substep. Unitree's
+    # walking task has the same sensor (and a cost on it); the get-up had none before v6.
+    self_collision = ContactSensorCfg(
+        name="self_collision",
+        primary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
+        secondary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
+        fields=("found", "force"),
+        reduce="maxforce",
+        num_slots=1,
+        history_length=4,
+    )
+    return body_ground, head_ground, self_collision
 
 
 def make_observations(play: bool, history: int,
@@ -126,7 +142,10 @@ def make_observations(play: bool, history: int,
 
 def make_rewards(pace_s: float = PACE_S, torque_budget: float = TORQUE_BUDGET,
                  speed_budget: float = SPEED_BUDGET, feet_high: float = FEET_HIGH,
-                 head_scale: float = HEAD_SCALE) -> dict[str, RewardTermCfg]:
+                 head_scale: float = HEAD_SCALE,
+                 self_collision: float = SELF_COLLISION,
+                 clearance: float = CLEARANCE,
+                 self_standing: float = SELF_STANDING) -> dict[str, RewardTermCfg]:
     """Weights are per second (mjlab multiplies every reward by dt = 0.02 s).
 
     Roughly, per second (once the pace schedule has reached standing): lying ~0.2,
@@ -151,6 +170,23 @@ def make_rewards(pace_s: float = PACE_S, torque_budget: float = TORQUE_BUDGET,
         # -- style -----------------------------------------------------------------------
         "head_ground": RewardTermCfg(func=gm.head_ground_contact, weight=-2.0 * head_scale),
         "head_impact": RewardTermCfg(func=gm.head_impact, weight=-4.0 * head_scale),
+        # One part of the robot pressing on another while getting up (an arm on the chest,
+        # a hand in the hip, a knee on the other foot): physics substeps of the step with
+        # such a contact above 1 N (0-4). At full weight a contact all the time costs 4 per
+        # second, like the head on the ground; in training the weight follows the success
+        # rate (getup_term.py). On the real robot the legs (88-139 N m) would crush the
+        # arms (25 N m).
+        "self_contact": RewardTermCfg(func=gm.self_contact_getting_up, weight=-self_collision,
+                                      params={"force_threshold": gm.SELF_FORCE_N,
+                                              "standing_weight": self_standing}),
+        # An arm link (shoulder yaw, elbow, hand) closer than 1 cm to the body or into it,
+        # getting up AND standing, measured as the self-collision benchmark does: with
+        # (stand-ins of) the collision shapes of Unitree's deploy scene, not the training
+        # model's capsules (clearance.py). Per pair the cm closer than 1 cm, summed: v6
+        # standing (right hand 8 cm into the hip) ~20 cm, i.e. 4 per second at full weight;
+        # nothing in the walking pose (2.1 cm). The weight follows the success rate.
+        "link_clearance": RewardTermCfg(func=gm.clearance_cost, weight=-clearance,
+                                        params={"margin": MARGIN_M, "cap": 0.10}),
         # Feet above the pelvis (m, summed over the feet): swinging the legs up for
         # momentum. 0.45 m (both legs over the back, lying face down) costs 3.6 per second.
         "feet_above_pelvis": RewardTermCfg(
@@ -190,6 +226,10 @@ def make_rewards(pace_s: float = PACE_S, torque_budget: float = TORQUE_BUDGET,
         del rewards["torque_budget"]
     if feet_high <= 0.0:
         del rewards["feet_above_pelvis"]
+    if self_collision <= 0.0:
+        del rewards["self_contact"]
+    if clearance <= 0.0:
+        del rewards["link_clearance"]
     return rewards
 
 
@@ -268,16 +308,24 @@ def make_getup_env_cfg(play: bool = False, num_envs: int | None = None,
                        speed_budget: float = SPEED_BUDGET,
                        push: float = 0.0, feet_high: float = FEET_HIGH,
                        head_scale: float = HEAD_SCALE,
-                       joint_dr: bool = JOINT_DR) -> ManagerBasedRlEnvCfg:
+                       joint_dr: bool = JOINT_DR,
+                       self_collision: float = SELF_COLLISION,
+                       clearance: float = CLEARANCE,
+                       self_standing: float = SELF_STANDING) -> ManagerBasedRlEnvCfg:
     """play=True: no observation noise, no curriculum, no assist force, 4 envs.
     realistic: DC motor torque-speed curve (robot.py). randomize: friction, torso COM and
     mass, encoder bias, PD gains, motor strength (once per env, at startup).
     pace_s, torque_budget, speed_budget: how fast it may get up (make_rewards).
     push: pushes once up (m/s, 0 = none; training uses PUSH).
-    feet_high, head_scale: style costs (make_rewards). joint_dr: joint friction, damping
-    and armature randomized (only with randomize)."""
-    rewards = make_rewards(pace_s, torque_budget, speed_budget, feet_high, head_scale)
+    feet_high, head_scale, self_collision, clearance: style costs (make_rewards). joint_dr:
+    joint friction, damping and armature randomized (only with randomize)."""
+    rewards = make_rewards(pace_s, torque_budget, speed_budget, feet_high, head_scale,
+                           self_collision, clearance, self_standing)
     getup = GetUpCommandCfg(reg_terms={n: rewards[n].weight for n in REG_TERMS if n in rewards})
+    if "self_contact" in rewards:      # its weight follows the success rate (getup_term.py)
+        getup.self_weight = float(self_collision)
+    if "link_clearance" in rewards:    # the same
+        getup.clear_weight = float(clearance)
     if play:
         getup.curriculum = False
         getup.assist_force = 0.0
